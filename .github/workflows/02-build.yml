@@ -247,6 +247,9 @@ jobs:
       - name: 应用 Agent 环境变量补丁
         run: python3 patch_agent_env.py --source-root zed
 
+      - name: 应用 commit 详情页默认状态补丁
+        run: python3 patch_commit_view_defaults.py --source-root zed
+
       - name: 安装编译依赖
         if: ${{ inputs.skip_check != true }}
         run: |
