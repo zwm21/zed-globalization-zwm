@@ -2,8 +2,19 @@
 """
 编译前补丁脚本：修改 Git Commit 详情页的默认展开状态（Zed 上游无对应设置项）。
 
-补丁点 1: 新标签页中文件 diff 默认折叠所有变更块（commit_view.rs 的多缓冲初始化）
-补丁点 2: 新标签页中提交描述默认展开（commit_view.rs 的 message_expanded 初始值）
+补丁点 1: commit_view.rs 多缓冲初始化改为“全部折叠”。
+补丁点 2: commit_view.rs 提交描述 message_expanded 初始值改为 true。
+补丁点 3: split.rs 删除 SplittableEditor::new 中无条件的 set_expand_all_diff_hunks
+          调用。该调用会把补丁点 1 设置的折叠标志重置回“全部展开”
+          （内部执行 multibuffer.set_all_diff_hunks_expanded），导致补丁点 1
+          失效——异步 diff 加载走 DiffUpdated{base_changed:true} 路径，
+          should_expand_hunk = was_previously_expanded || all_diff_hunks_expanded
+          会把全部 hunk 重新展开。删除后对上游其他调用方无影响：
+          - DiffMultibuffer（project_diff/staged_diff/branch_diff）自己在
+            diff_multibuffer.rs 初始化时已调用 set_all_diff_hunks_expanded；
+          - 上游 CommitView 也已在 commit_view.rs 初始化时显式设置（展开）；
+          - split.rs 测试同样显式设置后再构造 SplittableEditor。
+          即该行对所有既有调用方都是冗余的。
 
 用法: python3 patch_commit_view_defaults.py [--source-root zed] [--dry-run]
 
@@ -38,9 +49,15 @@ FALLBACK_ANCHOR = "MultiBuffer::new(Capability::ReadOnly);"
 # 补丁点 2 的锚点：CommitView 结构体中提交描述的展开状态初始值。
 MESSAGE_EXPANDED_ANCHOR = "message_expanded: false,"
 
+# 补丁点 3 的锚点：SplittableEditor::new 中把多缓冲强制置回“全部展开”的调用。
+# 该调用发生在 CommitView::new（含补丁点 1）之后，会覆盖折叠标志，必须删除。
+# 整个仓库中该调用仅此一处（split.rs）。
+EXPAND_ALL_CALL_ANCHOR = "editor.set_expand_all_diff_hunks(cx);"
+
 COMMIT_VIEW_PATH = "crates/git_ui/src/commit_view.rs"
 MULTI_BUFFER_PATH = "crates/multi_buffer/src/multi_buffer.rs"
 MULTI_BUFFER_API = "pub fn set_all_diff_hunks_collapsed(&mut self, cx: &mut Context<Self>)"
+SPLIT_PATH = "crates/editor/src/split.rs"
 
 
 def _read(path: Path) -> str | None:
@@ -142,6 +159,40 @@ def patch_expand_commit_message_by_default(source_root: Path, dry_run: bool) -> 
     return True
 
 
+def patch_remove_forced_expand(source_root: Path, dry_run: bool) -> bool:
+    """补丁点 3: 删除 SplittableEditor::new 中无条件的 set_expand_all_diff_hunks。
+
+    不删除会导致补丁点 1 被覆盖（标志重置回 true，diff 加载后全部展开）。
+    """
+    target = source_root / SPLIT_PATH
+    content = _read(target)
+    if content is None:
+        print(f"  WARN: 未找到 {SPLIT_PATH}（上游可能移动了文件）")
+        return False
+
+    idempotency_marker = f"{PATCH_MARKER} 移除 SplittableEditor 强制展开"
+    if idempotency_marker in content:
+        print(f"  SKIP: {target.name} 已包含补丁点 3 标记，跳过")
+        return True
+
+    if content.count(EXPAND_ALL_CALL_ANCHOR) != 1:
+        print(
+            f"  WARN: 锚点 {EXPAND_ALL_CALL_ANCHOR!r} 出现 {content.count(EXPAND_ALL_CALL_ANCHOR)} 次，"
+            "预期恰好 1 次，跳过以免误删"
+        )
+        return False
+
+    # 注意：注释中不能保留锚点子串，否则二次执行会重复替换（幂等破坏）。
+    replacement = (
+        f"// {PATCH_MARKER} 移除 SplittableEditor 强制展开：该调用会把多缓冲标志重置回全部展开，\n"
+        f"            // 覆盖 commit 详情页默认折叠补丁；上游所有 SplittableEditor::new 调用方\n"
+        f"            // 均已在构造前显式设置展开状态，此行冗余。\n"
+    )
+    patched = content.replace(EXPAND_ALL_CALL_ANCHOR, replacement, 1)
+    _write(target, patched, dry_run, target.name)
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="编译前补丁：commit 详情页默认折叠文件 diff 并展开提交描述"
@@ -178,8 +229,11 @@ def main() -> int:
     print("[补丁 2] 提交描述默认展开")
     r2 = patch_expand_commit_message_by_default(source_root, args.dry_run)
 
+    print("[补丁 3] 删除 SplittableEditor 强制展开（防止补丁 1 被覆盖）")
+    r3 = patch_remove_forced_expand(source_root, args.dry_run)
+
     print()
-    if r1 and r2:
+    if r1 and r2 and r3:
         print("全部补丁已就绪。")
         return 0
     else:
