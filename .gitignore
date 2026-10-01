@@ -60,3 +60,6 @@ target/
 
 # 本地 NSIS 安装器测试产物
 test-nsis/
+
+# 本地研究夹具（临时）
+.tmp-research/
