@@ -4,16 +4,65 @@
 > 本仓库是 l10n 流水线仓库，不含 Zed 源码；源码在构建时由 CI 克隆上游后打补丁。因此改动必须
 > 以"补丁脚本 + CI 接入"的形式交付，不能直接改 Zed 源码。
 
+## 〇、2026-10-01 修订：为什么第一版"折叠所有文件"没有生效（根因）
+
+第一版补丁只改了 `commit_view.rs`（307 行改为折叠、520 行 message_expanded 改 true）。
+远端构建实机验证结果：**描述展开生效，文件折叠不生效**。对 v1.21.0 源码的完整调用链分析
+找到根因，证据链如下（行号均为 v1.21.0）：
+
+1. `CommitView::new` 先创建 multibuffer 并（经补丁）调用
+   `set_all_diff_hunks_collapsed`（`commit_view.rs:305-309`），标志 `all_diff_hunks_expanded`
+   置为 false——此步本身有效；
+2. 紧接着 `CommitView::new` 创建 `SplittableEditor`（`commit_view.rs:320-328`），而
+   `SplittableEditor::new` 的第一件事就是无条件调用 `editor.set_expand_all_diff_hunks(cx)`
+   （`split.rs:626`），它内部执行 `buffer.set_all_diff_hunks_expanded(cx)`
+   （`crates/editor/src/git.rs:540-544`），**把刚设置的折叠标志重置回 true**；
+3. CommitView 的 diff 是异步加载的：excerpt 插入与 `add_diff` 都发生在其后
+   （`commit_view.rs:344-499`、`split.rs:1182-1232`）。`add_diff` 触发
+   `DiffUpdated{base_changed:true}` 路径（`multi_buffer.rs:2088-2094`），hunk 展开判定为
+   `should_expand_hunk = was_previously_expanded || all_diff_hunks_expanded`
+   （`multi_buffer.rs:2972-2974`）——标志已是 true，于是**全部展开**。
+4. `message_expanded` 是 CommitView 自有字段，`SplittableEditor` 不触碰它，所以补丁点 2
+   生效。与实机观察完全吻合。
+
+### 修复：新增补丁点 3
+
+删除 `split.rs:626` 的 `editor.set_expand_all_diff_hunks(cx);`（注释保留原行以便比对）。
+已验证该调用对上游所有 `SplittableEditor::new` 调用方都是**冗余**的，删除不改变上游既有行为：
+
+- `DiffMultibuffer`（project_diff / staged_diff / branch_diff 三个视图的底座）：其构造函数
+  已自行调用 `multibuffer.set_all_diff_hunks_expanded(cx)`（`diff_multibuffer.rs:73-77`），
+  editor 侧再设一次是重复；
+- 上游 `CommitView`：已在 `commit_view.rs:307` 显式设置展开（这正是 626 行不报错地
+  "重复"的原因），行为在补丁 1 中改为折叠，但语义仍是"由调用方显式决定"；
+- `split.rs` 自身测试：构造前也显式调用（`split.rs:2369`）；
+- 全仓库 grep：`set_expand_all_diff_hunks` 的调用点仅 `split.rs:626` 一处
+  （`crates/editor/src/git.rs:540` 是其定义）。
+
+### 连带影响核查（补丁点 3）
+
+- 文件头折叠/展开（fold_buffers，显示为单行文件头）与 hunk 折叠是**两套独立机制**
+  （block_map.folded_buffers vs multibuffer diff transforms），补丁不触碰前者；
+- toolbar 的增删行统计 `total_changed_lines`（`commit_view.rs:660`）与文件头
+  `changed_row_counts`（`element/header.rs:655`）都直接读 diff 快照的 summary，
+  不依赖展开状态——折叠后统计数字不变；
+- 文件头右侧的 Unfold/Fold 按钮、点击 hunk 折叠条展开、命令面板
+  `editor::ExpandAllDiffHunks`（Windows 默认键 `ctrl-"`）等交互能力全部保留；
+- `clear_expanded_diff_hunks`（Esc 恢复折叠）与 `has_any_expanded_diff_hunks`
+  （key context `diffs_expanded`）逻辑照常工作，因为它们读的就是同一标志位。
+
 ## 结论摘要
 
 1. Zed 上游**没有**任何现成设置项可以改变这两个默认状态（详见下节证据）。设置里唯一相近的
    是 `git_panel.collapse_untracked_diff`，它只影响 git 面板里"未跟踪文件"的 diff，与
    commit 详情页无关。
-2. 源码中两处初始值即可达成目标，改动共 2 行语义变更，且**不删减任何交互能力**：
+2. 达成目标需要**三处**改动（第一版只有前两处，第三处是第一版失效的根因）：
    - 文件 diff 默认折叠：`crates/git_ui/src/commit_view.rs:307` 的
      `multibuffer.set_all_diff_hunks_expanded(cx);` 改为 `set_all_diff_hunks_collapsed(cx);`
    - 提交描述默认展开：`crates/git_ui/src/commit_view.rs:520` 的
      `message_expanded: false,` 改为 `message_expanded: true,`
+   - 防覆盖：删除 `crates/editor/src/split.rs:626` 的
+     `editor.set_expand_all_diff_hunks(cx);`（见"〇"节）
 3. 已在工作区实现可复用补丁脚本 `patch_commit_view_defaults.py`（仿 `patch_agent_env.py`
    的约定：`--source-root` / `--dry-run`、补丁标记、幂等、上游锚点失效时退出码 1），并用
    v1.21.0 真实源码夹具验证：补丁可干净应用、重复执行幂等、上游改名时显式失败、
@@ -86,6 +135,9 @@ let multibuffer = cx.new(|cx| {
 - 新建文件的 hunk 在标志为 false 时会被跳过（第 2939 行）与不列入 hunk 列表（第 3494 行），
   即表现为"只显示文件头一行，可点击展开"，正是目标状态。
 
+**但该机制成立的前提是标志在后续不被覆盖**——`SplittableEditor::new`（`split.rs:626`）
+恰好在初始化时把它重置回 true（见"〇"节），因此还必须删除该调用。
+
 `CommitView` 的异步加载任务（`commit_view.rs:344-499`）不会重新展开 hunk；其中唯一的折叠
 调用 `editor.fold_buffers(binary_buffer_ids, cx)`（第 492 行）只针对二进制文件，与本次改动正交。
 
@@ -101,7 +153,7 @@ let multibuffer = cx.new(|cx| {
 因此把初始值改为 `true` 即"默认展开提交描述"； Disclosure 按钮、按钮文案
 （Fold/Expand Commit Description）与分裂行为都不变。
 
-## 三、最小改动内容（2 处、2 行语义变更）
+## 三、最小改动内容（3 处；前 2 处语义变更 + 第 3 处防覆盖删除）
 
 ```diff
 --- a/crates/git_ui/src/commit_view.rs
@@ -122,6 +174,22 @@ let multibuffer = cx.new(|cx| {
              message_scroll_handle: ScrollHandle::new(),
 ```
 
+```diff
+--- a/crates/editor/src/split.rs
++++ b/crates/editor/src/split.rs
+@@ -623,7 +623,10 @@ impl SplittableEditor {
+         let rhs_editor = cx.new(|cx| {
+             let mut editor =
+                 Editor::for_multibuffer(rhs_multibuffer.clone(), Some(project.clone()), window, cx);
+-            editor.set_expand_all_diff_hunks(cx);
++            // [ZED_GLOBALIZATION_PATCH] 移除 SplittableEditor 强制展开：该调用会把多缓冲标志重置回全部展开，
++            // 覆盖 commit 详情页默认折叠补丁；上游所有 SplittableEditor::new 调用方
++            // 均已在构造前显式设置展开状态，此行冗余。
+             editor.disable_runnables();
+             editor.disable_code_lens(cx);
+             editor.disable_inline_diagnostics();
+```
+
 补丁脚本 `patch_commit_view_defaults.py` 生成的结果与上面完全一致（已在 v1.21.0 夹具上 diff 验证）。
 
 ## 四、为什么不会影响软件功能
@@ -132,16 +200,22 @@ let multibuffer = cx.new(|cx| {
      实现见 `crates/editor/src/git.rs:982-1004`：折叠就是对同一 multibuffer 执行
      `collapse_diff_hunks(vec![Anchor::Min..Anchor::Max], cx)`——与本次改动的初始状态是同一状态。
    - 这些动作在命令面板可用，且有默认快捷键：Linux/Windows `ctrl-"` 展开全部、`ctrl-'`
-     切换选中 hunk；macOS `cmd-"` / `cmd-'`（`assets/keymaps/default-{linux,macos,windows}.json`）。
+     切换选中 hunk；macOS `cmd-"` / `cmd-'`（`assets/keymaps/default-{linux,macos,windows}.json`，
+     CollapseAllDiffHunks 无默认键位但命令面板可用）。
    - commit 详情页的 key context 为 `CommitDiff`（`commit_view.rs:1388`），内嵌编辑器获得焦点时
      这些 Editor 上下文动作依然作用于该视图（键位分发表按上下文路径匹配，不缺省失效）。
 2. `message_expanded` 不影响任何行为逻辑，只决定初始渲染高度；Disclosure 切换、
    `clone_on_split` 继承均不受影响。
-3. 改动不触碰 Git 数据加载、diff 计算、askpass、暂存/提交等任何功能路径；CommitView 的
+3. 补丁点 3 只删除一行冗余调用（对上游所有调用方均为 no-op 删除，论证见"〇"节），
+   不改变 `SplittableEditor` 的任何其他行为；unsplit/`set_show_deleted_hunks(true)`
+   等路径不受影响。
+4. 统计信息（toolbar 增删行数、文件头 +/- 计数）直接读 diff summary，与展开状态无关；
+   文件头折叠（fold_buffers）是另一套独立机制，不受本次改动影响。
+5. 改动不触碰 Git 数据加载、diff 计算、askpass、暂存/提交等任何功能路径；CommitView 的
    异步任务、二进制文件折叠逻辑不变。
-4. 补丁脚本对上游变化是"显式失败"而非"静默跳过"：若锚点消失或 `set_all_diff_hunks_collapsed`
-     被改名/移除，脚本退出码 1，CI 的 prepare 作业随之失败，不会产出"以为改了其实没改"的包。
-     （这与仓库既有 `patch_agent_env.py` 的失败语义一致。）
+6. 补丁脚本对上游变化是"显式失败"而非"静默跳过"：任一锚点消失或 `set_all_diff_hunks_collapsed`
+   被改名/移除，脚本退出码 1，CI 的 prepare 作业随之失败，不会产出"以为改了其实没改"的包。
+   （这与仓库既有 `patch_agent_env.py` 的失败语义一致。）
 
 ## 五、在本仓库的接入方式
 
@@ -161,7 +235,7 @@ let multibuffer = cx.new(|cx| {
 时序上该步骤必须满足三点，缺一不可：
 
 1. 在 `git clone` Zed 之后（有源码可改）；
-2. 在 `zedl10n replace` 之后（翻译替换只改字符串字面量，不会覆盖本补丁改的两个非字符串锚点，
+2. 在 `zedl10n replace` 之后（翻译替换只改字符串字面量，不会覆盖本补丁改的非字符串锚点，
    先后顺序其实无害，但保持"品牌→翻译→行为补丁"的固定次序便于排查）；
 3. 在 `git add -A && git diff --cached --binary > ../l10n.patch` **之前**——否则改动不会进入
    `l10n.patch`，各平台构建作业克隆的是干净上游源码并 `git apply l10n.patch`，改不到它们。
@@ -194,23 +268,36 @@ let multibuffer = cx.new(|cx| {
   应改为读取上游设置。
 - **方案 C：等上游支持**。目前未发现上游有相关设置或明确 issue，不作为依据。
 
-## 七、本地验证证据（本轮完成）
+## 七、本地验证证据
 
-用 v1.21.0 真实源码（`crates/git_ui/src/commit_view.rs`、`crates/multi_buffer/src/multi_buffer.rs`）
-搭建夹具执行 `patch_commit_view_defaults.py`：
+### 2026-10-01 本轮（含补丁点 3）
+
+用 v1.21.0 真实源码（`commit_view.rs`、`split.rs`、`multi_buffer.rs`）搭建夹具执行修订后的
+`patch_commit_view_defaults.py`：
 
 | 场景 | 结果 |
 | --- | --- |
-| `--dry-run` | 两个补丁点均识别到锚点，不落盘 |
-| 正式执行 | 两处补丁成功，退出码 0；与原文件 diff 仅 2 处语义变更、换行符保持 LF 不变 |
-| 二次执行（幂等） | 两处均 SKIP，退出码 0 |
+| `--dry-run` | 三个补丁点均识别到锚点，不落盘（与原文件 diff 为空） |
+| 正式执行 | 三处补丁成功，退出码 0；换行符保持 LF |
+| 二次执行（幂等） | 三处均 SKIP，退出码 0（补丁点 3 初版发现幂等标记不匹配导致注释叠加的 bug，已修复并重测） |
+| split.rs 锚点被上游改写 | 补丁点 3 报 WARN，退出码 1（显式失败） |
+| `rustfmt --check`（edition 2024） | 补丁后 `commit_view.rs` 与 `split.rs` 均通过；原文件同样通过，故检查有效 |
+| 补丁后 split.rs 中活的强制展开调用 | grep 为 0（仅注释中出现） |
+
+### 2026-09-30 第一版（补丁点 1、2）
+
+| 场景 | 结果 |
+| --- | --- |
+| 正式执行 | 两处补丁成功，退出码 0；换行符保持 LF 不变 |
 | 上游把 `set_all_diff_hunks_collapsed` 改名 | 补丁点 0 报 WARN，补丁点 1 不执行，退出码 1 |
 | 上游改写多缓冲初始化（主锚点消失） | 走兜底锚点注入 `MultiBuffer::new(Capability::ReadOnly)` 之后，退出码 0 |
-| `rustfmt --check`（edition 2024，补丁后文件） | 通过，语法有效且格式与上游一致（原文件同样通过，故检查有效） |
-| 换到上游 `main` 分支重跑（2026-09-30） | 两个锚点行号与 v1.21.0 完全一致（307 / 520），补丁同样干净应用且 `rustfmt --check` 通过——短期内上游版本迭代不会让补丁失效 |
+| 换到上游 `main` 分支重跑（2026-09-30） | 两个锚点行号与 v1.21.0 完全一致（307 / 520） |
 
 未做（环境限制，需 CI 兜底）：在本机编译 Zed；工作区不含 Zed 源码，克隆整仓进行研究超出
 "只在工作区内活动"的约束。编译级验证依赖 `prepare` 作业现有的 `cargo check` 步骤。
+**第一版曾据此认为"两行改动即可"，但静态夹具无法发现运行期标志覆盖（补丁点 3 的缺失），
+本轮已通过完整调用链分析补上；远端实机验证（small-scope 构建 + 实机点击 commit）仍是
+最终判据。**
 
 ## 八、复现研究的入口
 
